@@ -15,7 +15,7 @@ def main():
         description="Train with properly fixed adaptive compression"
     )
     parser.add_argument(
-        "--model_name", type=str, default="gpt2", help="Base model to use"
+        "--model_name", type=str, default="gpt2-xl", help="Base model to use"
     )
     parser.add_argument(
         "--data_path", type=str, default="sample_data.txt", help="Path to training data"
@@ -23,7 +23,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="enhanced_model_conservative",
+        default="enhanced_model_conservative1",
         help="Directory to save model",
     )
     parser.add_argument(

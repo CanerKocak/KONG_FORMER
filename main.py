@@ -1362,23 +1362,23 @@ class RecursiveCompressionModel(nn.Module):
 
     def __init__(
         self,
-        base_model_name: str = "gpt2",
-        num_compression_layers: int = 1,
-        compression_factor: int = 2,
-        freeze_base_model: bool = True,
-        similarity_threshold: float = 0.95,
-        position_weight: float = 0.2,
-        percentile_threshold: float = 95.0,
-        preserve_special_tokens: bool = True,
+        base_model_name: str = "gpt2-xl",  # CORRECT NAME for 1.5B parameter version
+        num_compression_layers: int = 1,  # fine
+        compression_factor: int = 4,  # CRANKED UP for maximum neural torture
+        freeze_base_model: bool = False,  # Let that fucker LEARN while it SUFFERS
+        similarity_threshold: float = 0.85,  # AGGRESSIVE AF threshold - fucking BRUTAL
+        position_weight: float = 0.2,  # fine
+        percentile_threshold: float = 90.0,  # slightly more aggressive
+        preserve_special_tokens: bool = True,  # Keep this True unless you want GIBBERISH
         residual_compression_factor: int = 4,
         use_residuals: bool = True,
-        residual_gate_threshold: float = 0.1,
-        residual_sparsity: float = 0.9,
+        residual_gate_threshold: float = 0.05,  # More aggressive residual gating
+        residual_sparsity: float = 0.85,  # More sparse residuals = MORE PAIN
         residual_bits: int = 8,
-        residual_importance_threshold: float = 0.1,
-        adaptive_compression: bool = False,
+        residual_importance_threshold: float = 0.05,  # Lower = more aggressive
+        adaptive_compression: bool = True,  # ABSOLUTELY CRITICAL - turn this shit ON
         min_compression_factor: int = 2,
-        max_compression_factor: int = 8,
+        max_compression_factor: int = 8,  # Keep this high for max potential compression
     ):
         super().__init__()
         # Load base model and tokenizer
