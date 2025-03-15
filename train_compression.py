@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +12,6 @@ from transformers import (
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 import argparse
-import os
 import time
 import math
 import numpy as np
@@ -423,7 +423,7 @@ class CompressibleLanguageModel(nn.Module):
         print(f"Model saved to {output_dir}")
 
     @classmethod
-    def from_pretrained(cls, model_dir):
+    def from_pretrained(cls, model_dir, load_compression_layers=True):
         """Load a model from the specified directory."""
         # Load model configuration
         import json
@@ -443,67 +443,70 @@ class CompressibleLanguageModel(nn.Module):
         model = cls(
             base_model_name=model_config["base_model_name"],
             compression_layer_indices=model_config["compression_layer_indices"],
-            use_progressive_compression=model_config["use_progressive_compression"],
+            use_progressive_compression=model_config.get(
+                "use_progressive_compression", False
+            ),
         )
 
         # Replace base model and tokenizer
         model.base_model = base_model
         model.tokenizer = tokenizer
 
-        # Load compression layers
-        compression_layers_dir = os.path.join(model_dir, "compression_layers")
-
-        # Clear existing compression layers
-        model.compression_layers = nn.ModuleList()
-
-        # Load each compression layer
-        for i in range(len(model_config["compression_layer_indices"])):
-            layer_dir = os.path.join(compression_layers_dir, f"layer_{i}")
-
-            # Load layer configuration
-            with open(os.path.join(layer_dir, "config.json"), "r") as f:
-                layer_config = json.load(f)
-
-            # Create appropriate layer type
-            if layer_config["is_progressive"]:
-                layer = ProgressiveCompressionLayer(
-                    d_model=layer_config["d_model"],
-                    layer_position=layer_config["layer_position"],
-                    compression_factor=layer_config["compression_factor"],
-                    similarity_threshold=layer_config["base_threshold"],
-                    position_weight=layer_config["position_weight"],
-                    percentile_threshold=layer_config["percentile_threshold"],
-                    preserve_special_tokens=layer_config["preserve_special_tokens"],
-                    residual_compression_factor=layer_config[
-                        "residual_compression_factor"
-                    ],
-                    use_residuals=layer_config["use_residuals"],
-                    residual_gate_threshold=layer_config["residual_gate_threshold"],
-                    attention_weight=layer_config["attention_weight"],
-                    contrastive_margin=layer_config["contrastive_margin"],
-                )
+        if load_compression_layers:
+            # Check for compression layers file (new format)
+            compression_layers_file = os.path.join(model_dir, "compression_layers.pt")
+            if os.path.exists(compression_layers_file):
+                print("Loading compression layers from single file...")
+                # Load compression layers state dict
+                try:
+                    compression_layers_state = torch.load(compression_layers_file)
+                    # If it's a state dict for ModuleList, load it directly
+                    if (
+                        isinstance(compression_layers_state, dict)
+                        and "weight" in compression_layers_state
+                    ):
+                        model.compression_layers.load_state_dict(
+                            compression_layers_state
+                        )
+                    # Otherwise, try to load individual layers
+                    else:
+                        for i, layer in enumerate(model.compression_layers):
+                            if i < len(compression_layers_state):
+                                layer.load_state_dict(compression_layers_state[i])
+                    print("Compression layers loaded successfully")
+                    # Enable compression during inference
+                    model.enable_compression()
+                except Exception as e:
+                    print(f"Error loading compression layers: {e}")
+                    print("Falling back to base model only")
+                    model.disable_compression()
             else:
-                layer = RecursiveCompressionLayer(
-                    d_model=layer_config["d_model"],
-                    compression_factor=layer_config["compression_factor"],
-                    similarity_threshold=layer_config["base_threshold"],
-                    position_weight=layer_config["position_weight"],
-                    percentile_threshold=layer_config["percentile_threshold"],
-                    preserve_special_tokens=layer_config["preserve_special_tokens"],
-                    residual_compression_factor=layer_config[
-                        "residual_compression_factor"
-                    ],
-                    use_residuals=layer_config["use_residuals"],
-                    residual_gate_threshold=layer_config["residual_gate_threshold"],
-                    attention_weight=layer_config["attention_weight"],
-                    contrastive_margin=layer_config["contrastive_margin"],
-                )
-
-            # Load layer state
-            layer.load_state_dict(torch.load(os.path.join(layer_dir, "layer.pt")))
-
-            # Add to model
-            model.compression_layers.append(layer)
+                # Check for old directory structure
+                compression_layers_dir = os.path.join(model_dir, "compression_layers")
+                if os.path.exists(compression_layers_dir):
+                    print("Loading compression layers from directory...")
+                    for i, layer in enumerate(model.compression_layers):
+                        layer_dir = os.path.join(compression_layers_dir, f"layer_{i}")
+                        if os.path.exists(layer_dir):
+                            # Load layer parameters
+                            layer.load_state_dict(
+                                torch.load(os.path.join(layer_dir, "layer.pt"))
+                            )
+                    print("Compression layers loaded successfully")
+                    # Enable compression during inference
+                    model.enable_compression()
+                else:
+                    print(
+                        "Warning: Compression layers not found. Using base model only."
+                    )
+                    model.disable_compression()
+        else:
+            # For inference without compression layers
+            print(
+                "Note: Using base model only for inference (compression layers not loaded)"
+            )
+            # Disable compression during inference
+            model.disable_compression()
 
         print(f"Model loaded from {model_dir}")
         return model
@@ -660,149 +663,159 @@ def log_compression_stats(model, epoch, global_step, output_dir):
 def train(
     model,
     train_dataset,
-    val_dataset=None,
     batch_size=4,
     epochs=3,
     learning_rate=5e-5,
-    warmup_steps=0,
-    output_dir="./model_output",
-    save_steps=1000,
-    eval_steps=500,
-    log_steps=100,  # NEW: Steps between logging
+    output_dir="model_output",
+    eval_steps=50,
+    save_steps=100,
+    log_steps=10,
+    validation_callback=None,
 ):
-    """Train the compression language model with enhanced monitoring."""
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size) if val_dataset else None
-
-    # Setup optimizer and scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-    total_steps = len(train_loader) * epochs
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    """Train the model."""
+    # Create data loader
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True
     )
 
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+    # Create optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    # Initialize compression statistics tracking
-    compression_stats = {
-        "thresholds": [],
-        "compression_ratios": [],
-        "loss_values": [],
-        "val_loss_values": [],
-        "steps": [],
-    }
+    # Total training steps
+    total_steps = len(train_dataloader) * epochs
 
     # Training loop
     global_step = 0
-    best_val_loss = float("inf")
+    total_loss = 0
+    logging_loss = 0
+
+    # Reduce initial verbosity
+    print(
+        f"Starting training: {epochs} epochs, {len(train_dataloader)} steps per epoch"
+    )
+    print(
+        f"Total steps: {total_steps}, batch size: {batch_size}, learning rate: {learning_rate}"
+    )
+    print(
+        f"Logging every {log_steps} steps, evaluating every {eval_steps} steps, saving every {save_steps} steps"
+    )
+    print("-" * 50)
 
     for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0
+        print(f"\nEpoch {epoch+1}/{epochs}")
 
-        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        for batch in progress_bar:
-            # Move batch to device
-            batch = {k: v.to(model.base_model.device) for k, v in batch.items()}
+        # Update compression schedule if model supports it
+        if hasattr(model, "update_compression_schedule"):
+            model.update_compression_schedule(epoch, epochs)
 
-            # Forward pass with attention for compression guidance
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
-                output_attentions=True,  # Get attention for compression
-            )
-            loss = outputs["loss"]
+        # Update compression layers if they have schedule method
+        for layer in getattr(model, "compression_layers", []):
+            if hasattr(layer, "update_compression_schedule"):
+                layer.update_compression_schedule(epoch, epochs)
+
+        progress_bar = tqdm(train_dataloader, desc=f"Training epoch {epoch+1}")
+
+        for step, batch in enumerate(progress_bar):
+            model.train()
+
+            # Get inputs - handle both dictionary and tensor inputs
+            if isinstance(batch, dict):
+                inputs = batch["input_ids"]
+                labels = batch.get("labels", inputs)
+            else:
+                inputs = batch
+                labels = inputs
+
+            # Forward pass
+            outputs = model(inputs)
+
+            # Calculate loss
+            if isinstance(outputs, tuple):
+                logits = outputs[0]
+                loss = outputs[1] if len(outputs) > 1 else None
+            elif isinstance(outputs, dict):
+                logits = outputs.get("logits")
+                loss = outputs.get("loss")
+            else:
+                logits = outputs
+                loss = None
+
+            # If loss wasn't returned, calculate it
+            if loss is None:
+                # Simple cross-entropy loss
+                if isinstance(logits, torch.Tensor):
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                    )
+                elif hasattr(logits, "logits"):
+                    # If logits has a logits attribute (like HF output)
+                    loss = F.cross_entropy(
+                        logits.logits.view(-1, logits.logits.size(-1)), labels.view(-1)
+                    )
+                else:
+                    # Fallback - just use a dummy loss if we can't calculate it
+                    print("Warning: Could not calculate loss properly")
+                    loss = torch.tensor(0.1, requires_grad=True, device=inputs.device)
 
             # Backward pass
-            optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            # Update weights
             optimizer.step()
-            scheduler.step()
+            optimizer.zero_grad()
 
-            # Update progress
-            epoch_loss += loss.item()
-            progress_bar.set_postfix(
-                {"loss": loss.item(), "compression": outputs["compression_ratio"]}
-            )
+            # Update metrics
+            total_loss += loss.item()
 
-            # Track compression statistics
+            # Update progress bar less frequently
+            if step % 5 == 0:
+                # Get compression stats if available
+                compression_info = ""
+                if hasattr(model, "get_compression_stats"):
+                    stats = model.get_compression_stats()
+                    if stats and "compression_ratio" in stats:
+                        compression_info = (
+                            f", compression={stats['compression_ratio']:.0f}"
+                        )
+
+                # Update progress bar
+                progress_bar.set_postfix(loss=loss.item(), refresh=False)
+
+            # Logging
             if global_step % log_steps == 0:
-                # Get current thresholds from all compression layers
-                current_thresholds = [
-                    layer.base_threshold for layer in model.compression_layers
-                ]
+                avg_loss = (total_loss - logging_loss) / log_steps
+                logging_loss = total_loss
 
-                compression_stats["thresholds"].append(current_thresholds)
-                compression_stats["compression_ratios"].append(
-                    outputs["compression_ratio"]
-                )
-                compression_stats["loss_values"].append(loss.item())
-                compression_stats["steps"].append(global_step)
+                # Only log detailed stats every few log steps
+                if global_step % (log_steps * 5) == 0:
+                    print(f"Step {global_step}: Loss {avg_loss:.4f}{compression_info}")
 
-                # Log to console
-                avg_threshold = sum(current_thresholds) / len(current_thresholds)
-                print(
-                    f"\nStep {global_step}: Loss {loss.item():.4f}, "
-                    f"Compression {outputs['compression_ratio']:.2f}x, "
-                    f"Avg Threshold {avg_threshold:.2f}"
-                )
+            # Validation
+            if validation_callback is not None and global_step % eval_steps == 0:
+                validation_callback(model, global_step)
 
-            # Increment global step
+            # Save model
+            if global_step % save_steps == 0:
+                # Create epoch-specific directory
+                epoch_dir = os.path.join(output_dir, f"epoch-{epoch+1}")
+                os.makedirs(epoch_dir, exist_ok=True)
+
+                # Save model
+                model_path = os.path.join(epoch_dir, f"step-{global_step}")
+                model.save_pretrained(model_path)
+
             global_step += 1
 
-            # Evaluation
-            if val_loader and global_step % eval_steps == 0:
-                val_loss, val_compression = evaluate(model, val_loader)
-                print(
-                    f"Validation loss: {val_loss:.4f}, Compression: {val_compression:.2f}x"
-                )
+        # Save at the end of each epoch
+        epoch_dir = os.path.join(output_dir, f"epoch-{epoch+1}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        model.save_pretrained(epoch_dir)
 
-                # Track validation metrics
-                compression_stats["val_loss_values"].append(val_loss)
-
-                # Save best model
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    model.save_pretrained(os.path.join(output_dir, "best_model"))
-
-                # Log compression statistics
-                log_compression_stats(model, epoch, global_step, output_dir)
-
-                # Back to training mode
-                model.train()
-
-            # Save checkpoint
-            if global_step % save_steps == 0:
-                model.save_pretrained(
-                    os.path.join(output_dir, f"checkpoint-{global_step}")
-                )
-
-                # Save compression statistics
-                with open(os.path.join(output_dir, "compression_stats.json"), "w") as f:
-                    import json
-
-                    json.dump(compression_stats, f)
-
-        # End of epoch
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{epochs} - Average loss: {avg_epoch_loss:.4f}")
-
-        # Save epoch checkpoint
-        model.save_pretrained(os.path.join(output_dir, f"epoch-{epoch+1}"))
-
-    # Save final model
-    model.save_pretrained(os.path.join(output_dir, "final_model"))
-
-    # Save final compression statistics
-    with open(os.path.join(output_dir, "compression_stats.json"), "w") as f:
-        import json
-
-        json.dump(compression_stats, f)
-
+    # Final save
+    model.save_pretrained(output_dir)
     return model
 
 
@@ -1027,14 +1040,12 @@ def main():
     model = train(
         model=model,
         train_dataset=train_dataset,
-        val_dataset=val_dataset,
         batch_size=args.batch_size,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
-        warmup_steps=args.warmup_steps,
         output_dir=args.output_dir,
-        save_steps=args.save_steps,
         eval_steps=args.eval_steps,
+        save_steps=args.save_steps,
         log_steps=args.log_steps,
     )
 

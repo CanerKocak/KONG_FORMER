@@ -4,6 +4,9 @@ import psutil
 import os
 from train_compression import CompressibleLanguageModel
 
+# Set environment variable for MPS fallback to fix PyTorch MPS bug
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 
 def get_memory_usage():
     """Get the current memory usage of the process in MB"""
@@ -28,9 +31,9 @@ print(f"Device: {device}")
 print("Loading original model...")
 model_original = CompressibleLanguageModel(base_model_name="gpt2").to(device)
 print("Loading compressed model...")
-model_compressed = CompressibleLanguageModel.load("compressed_model/final_model").to(
-    device
-)
+model_compressed = CompressibleLanguageModel.from_pretrained(
+    "compressed_model/final_model", load_compression_layers=True
+).to(device)
 
 # Test with different sequence lengths - reduced for faster completion
 sequence_lengths = [32, 64, 128]
@@ -139,7 +142,7 @@ print(f"Original model parameters: {orig_params:.2f} million")
 print(f"Compressed model parameters: {comp_params:.2f} million")
 print(f"Parameter reduction: {param_reduction:.2f}%")
 
-# Generate text comparison
+# Generate text comparison using our custom generate_text function
 print("\n=== Text Generation Comparison ===")
 prompt = "Artificial intelligence will"
 max_length = 100
@@ -147,36 +150,26 @@ temperature = 0.8
 top_p = 0.9
 
 print(f"Prompt: '{prompt}'")
+
+# Use the generate_text function from train_compression.py
+from train_compression import generate_text
+
 print("\nOriginal model output:")
-with torch.no_grad():
-    input_ids = model_original.tokenizer(prompt, return_tensors="pt").input_ids.to(
-        device
-    )
-    output_ids = model_original.base_model.generate(
-        input_ids,
-        max_length=max_length,
-        temperature=temperature,
-        top_p=top_p,
-        do_sample=True,
-    )
-    output_text = model_original.tokenizer.decode(
-        output_ids[0], skip_special_tokens=True
-    )
-    print(output_text)
+original_output = generate_text(
+    model=model_original,
+    prompt=prompt,
+    max_length=max_length,
+    temperature=temperature,
+    top_p=top_p,
+)
+print(original_output)
 
 print("\nCompressed model output:")
-with torch.no_grad():
-    input_ids = model_compressed.tokenizer(prompt, return_tensors="pt").input_ids.to(
-        device
-    )
-    output_ids = model_compressed.base_model.generate(
-        input_ids,
-        max_length=max_length,
-        temperature=temperature,
-        top_p=top_p,
-        do_sample=True,
-    )
-    output_text = model_compressed.tokenizer.decode(
-        output_ids[0], skip_special_tokens=True
-    )
-    print(output_text)
+compressed_output = generate_text(
+    model=model_compressed,
+    prompt=prompt,
+    max_length=max_length,
+    temperature=temperature,
+    top_p=top_p,
+)
+print(compressed_output)

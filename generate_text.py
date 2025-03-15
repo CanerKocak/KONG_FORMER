@@ -32,18 +32,20 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading model from {args.model_dir}...")
-    model = CompressibleLanguageModel.load(args.model_dir)
+    model = CompressibleLanguageModel.from_pretrained(
+        args.model_dir, load_compression_layers=True
+    )
 
-    # Move model to GPU if available
+    # Move model to GPU if available, but avoid MPS (Apple GPU) due to compatibility issues
     if torch.cuda.is_available():
         device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
     else:
         device = torch.device("cpu")
     model.to(device)
 
     print(f"Generating text with prompt: '{args.prompt}'")
+
+    # Use the generate_text function from train_compression.py
     generated_text = generate_text(
         model=model,
         prompt=args.prompt,

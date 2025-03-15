@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 import math
 import argparse
+import random
 
 
 @dataclass
@@ -298,6 +299,37 @@ class RecursiveCompressionLayer(nn.Module):
         percentile_idx = int(len(sorted_importances) * 0.90)  # Using 90th percentile
         adaptive_threshold = sorted_importances[percentile_idx]
 
+        # Use the current_threshold (which may be adaptive) instead of base_threshold
+        # for similarity comparisons in clustering
+        similarity_threshold = getattr(self, "current_threshold", self.base_threshold)
+
+        # Print thresholds for debugging - handle tensor values properly
+        if isinstance(self.base_threshold, torch.Tensor):
+            if self.base_threshold.numel() == 1:
+                base_threshold_val = self.base_threshold.item()
+            else:
+                # If it's a multi-element tensor, use the first value
+                base_threshold_val = self.base_threshold[0].item()
+        else:
+            base_threshold_val = self.base_threshold
+
+        if isinstance(similarity_threshold, torch.Tensor):
+            if similarity_threshold.numel() == 1:
+                similarity_threshold_val = similarity_threshold.item()
+            else:
+                # If it's a multi-element tensor, use the first value
+                similarity_threshold_val = similarity_threshold[0].item()
+        else:
+            similarity_threshold_val = similarity_threshold
+
+        # Print thresholds for debugging - handle tensor values properly - MAKE LESS VERBOSE
+        if (
+            self.training and random.random() < 0.05
+        ):  # Only print 5% of the time during training
+            print(
+                f"DEBUG: base_threshold={base_threshold_val:.4f}, current_threshold={similarity_threshold_val:.4f}"
+            )
+
         # Find important tokens with stricter criteria
         important_indices = torch.where(token_importances > adaptive_threshold)[0]
 
@@ -305,8 +337,97 @@ class RecursiveCompressionLayer(nn.Module):
         compressed_centroids = []
         token_compression_factors = []
 
+        # CRITICAL FIX: If similarity threshold is too low, force it higher to prevent over-compression
+        if similarity_threshold_val < 0.90 and self.training:
+            print(
+                f"⚠️ WARNING: Similarity threshold too low ({similarity_threshold_val:.4f}), forcing to minimum 0.90"
+            )
+            similarity_threshold_val = max(similarity_threshold_val, 0.90)
+            # Convert back to tensor if needed
+            if isinstance(similarity_threshold, torch.Tensor):
+                similarity_threshold = torch.tensor(
+                    similarity_threshold_val, device=device
+                )
+            else:
+                similarity_threshold = similarity_threshold_val
+
+        # NEW SAFETY CHECK: Estimate compression ratio before proceeding
+        # If we're going to compress too aggressively, adjust threshold immediately
+        estimated_compression = 0
+        for i in range(seq_len):
+            token = tokens[:, i, :]
+            similarities = torch.cosine_similarity(token.unsqueeze(1), tokens, dim=2)
+            similar_indices = torch.where(similarities > similarity_threshold_val)[1]
+            if len(similar_indices) > 1:
+                estimated_compression += 1
+
+        # Get max_compression_ratio if it exists, otherwise use default of 20.0
+        max_ratio = getattr(self, "max_compression_ratio", 5.0)  # Reduced from 20.0
+
+        # Calculate how many tokens we need to keep to achieve max_ratio
+        # We need to keep at least seq_len / max_ratio tokens
+        # Use floor instead of ceil to ensure we don't exceed max_ratio
+        tokens_to_keep = math.floor(seq_len / max_ratio)
+        # Ensure we keep at least 4 tokens (more conservative)
+        tokens_to_keep = max(tokens_to_keep, 4)
+        tokens_to_compress = seq_len - tokens_to_keep
+
+        # Print target compression info - MAKE LESS VERBOSE
+        if estimated_compression > 0 and (
+            not self.training or random.random() < 0.05
+        ):  # Only print 5% of the time during training
+            # Avoid division by zero by ensuring denominator is at least 1
+            remaining_tokens = max(1, seq_len - estimated_compression)
+            estimated_ratio = seq_len / remaining_tokens
+
+            print(
+                f"Target compression: {max_ratio:.2f}x (keeping {tokens_to_keep}/{seq_len} tokens, compressing {tokens_to_compress})"
+            )
+
+            if (
+                estimated_ratio > max_ratio
+            ):  # Use configurable upper bound on compression ratio
+                print(
+                    f"🚨 EMERGENCY: Estimated compression ratio too high ({estimated_ratio:.2f}x)!"
+                )
+                print(
+                    f"Forcing similarity threshold higher to prevent model destruction..."
+                )
+
+                # Force much higher threshold to prevent catastrophic compression
+                similarity_threshold_val = max(
+                    similarity_threshold_val, 0.99
+                )  # Increased from 0.95
+                if isinstance(similarity_threshold, torch.Tensor):
+                    similarity_threshold = torch.tensor(
+                        similarity_threshold_val, device=device
+                    )
+                else:
+                    similarity_threshold = similarity_threshold_val
+                print(f"Emergency threshold adjustment: {similarity_threshold_val:.4f}")
+                # Also update base threshold for future iterations
+                self.base_threshold = max(
+                    self.base_threshold, 0.95
+                )  # Increased from 0.90
+
+        # NEW: Create a list to track which tokens have been compressed
+        compressed_token_count = 0
+        already_compressed = set()
+
         # Process each token with enhanced similarity analysis
         for i in range(seq_len):
+            # NEW: Skip if we've already compressed the maximum allowed tokens
+            if (
+                compressed_token_count >= tokens_to_compress
+                and i not in already_compressed
+            ):
+                # Just use standard compression for this token without merging
+                compressed_token = self.compressor(tokens[:, i, :])
+                factor = self.compression_factor
+                compressed_centroids.append(compressed_token)
+                token_compression_factors.append(factor)
+                continue
+
             token = tokens[:, i, :]  # Shape: [batch_size, d_model]
 
             # Enhanced importance-based compression
@@ -321,9 +442,14 @@ class RecursiveCompressionLayer(nn.Module):
                 similarities = torch.cosine_similarity(
                     token.unsqueeze(1), tokens, dim=2
                 )
-                similar_indices = torch.where(similarities > self.base_threshold)[1]
+                similar_indices = torch.where(similarities > similarity_threshold_val)[
+                    1
+                ]
 
-                if len(similar_indices) > 1:
+                if (
+                    len(similar_indices) > 1
+                    and compressed_token_count < tokens_to_compress
+                ):
                     # Enhanced clustering with attention to token positions
                     cluster_tokens = tokens[:, similar_indices, :]
                     # Weight tokens by position similarity
@@ -343,12 +469,35 @@ class RecursiveCompressionLayer(nn.Module):
 
                     # Compress with adaptive factor based on cluster size
                     cluster_size = len(similar_indices)
-                    adaptive_factor = min(
+                    # Get max_compression_ratio if it exists, otherwise use default max factor
+                    max_factor = min(
+                        getattr(
+                            self, "max_compression_ratio", self.max_compression_factor
+                        ),
                         self.max_compression_factor,
-                        self.compression_factor + int(math.log2(cluster_size)),
                     )
+
+                    # More conservative adaptive factor calculation
+                    # Use logarithm with base 4 instead of base 2 for slower growth
+                    log_factor = math.log(max(cluster_size, 2)) / math.log(4)
+                    adaptive_factor = min(
+                        max_factor, self.compression_factor + int(log_factor)
+                    )
+
+                    # Cap the adaptive factor to avoid exceeding max_ratio
+                    if hasattr(self, "max_compression_ratio"):
+                        adaptive_factor = min(
+                            adaptive_factor, self.max_compression_ratio
+                        )
+
                     compressed_token = self.compressor(centroid)
                     factor = adaptive_factor
+
+                    # Track which tokens have been compressed
+                    compressed_token_count += (
+                        len(similar_indices) - 1
+                    )  # -1 because we're keeping one token
+                    already_compressed.update(similar_indices.tolist())
                 else:
                     # No similar tokens found - use standard compression
                     compressed_token = self.compressor(token)
@@ -380,6 +529,21 @@ class RecursiveCompressionLayer(nn.Module):
         # Create dummy clusters tensor for compatibility with our enhanced implementation
         clusters = torch.zeros((batch_size, seq_len), dtype=torch.long, device=device)
 
+        # Print actual compression achieved - MAKE LESS VERBOSE
+        if (
+            not self.training or random.random() < 0.05
+        ):  # Only print 5% of the time during training
+            # Ensure we never compress all tokens (avoid division by zero)
+            safe_compressed_token_count = min(compressed_token_count, seq_len - 1)
+            actual_ratio = (
+                seq_len / (seq_len - safe_compressed_token_count)
+                if safe_compressed_token_count > 0
+                else 1.0
+            )
+            print(
+                f"Actual compression ratio: {actual_ratio:.2f}x (compressed {compressed_token_count}/{seq_len} tokens)"
+            )
+
         return (
             CompressionState(
                 centroids=compressed_centroids,
@@ -394,7 +558,15 @@ class RecursiveCompressionLayer(nn.Module):
         # Store original states for reconstruction loss
         original_states = hidden_states.clone()
 
-        # Apply compression
+        # Calculate adaptive threshold for this forward pass if in training mode
+        if self.adaptive_compression and self.training:
+            adaptive_threshold = self.compute_adaptive_threshold(hidden_states)
+            # Actually use the computed threshold instead of just the base_threshold
+            self.current_threshold = adaptive_threshold
+        else:
+            self.current_threshold = self.base_threshold
+
+        # Apply compression - pass the current threshold to compress method
         compressed_state, clusters = self.compress(hidden_states, attention_scores)
 
         # Decompress the state
@@ -418,13 +590,17 @@ class RecursiveCompressionLayer(nn.Module):
                     loss_increase = ce_loss / self.last_ce_loss
 
                     # If loss increases dramatically, adjust threshold for next iteration
-                    if loss_increase > 1.5:  # 50% increase in loss
+                    # Lower the threshold from 1.5 to 1.2 for more sensitivity
+                    if loss_increase > 1.2:  # Was 1.5
                         self.base_threshold = min(0.95, self.base_threshold + 0.05)
                         print(
                             f"⚠️ Emergency parachute deployed! Increasing threshold to {self.base_threshold:.2f}"
                         )
-                    elif loss_increase < 0.8:  # Loss decreased significantly
-                        self.base_threshold = max(0.75, self.base_threshold - 0.01)
+                    # Make this more aggressive too
+                    elif loss_increase < 0.9:  # Was 0.8
+                        self.base_threshold = max(
+                            0.65, self.base_threshold - 0.02
+                        )  # More reduction
                         print(
                             f"🚀 Compression successful! Decreasing threshold to {self.base_threshold:.2f}"
                         )
@@ -479,31 +655,22 @@ class RecursiveCompressionLayer(nn.Module):
         token_ids: List[int] = None,
     ) -> Tuple[torch.Tensor, Dict[int, int]]:
         """
-        Find semantically redundant activations using cosine similarity with adaptive thresholding,
-        positional weighting, and token importance.
+        Detect redundant tokens in the input activations.
 
         Args:
-            activations (torch.Tensor): Tensor of shape (num_tokens, d_model).
-            positions (List[int], optional): Original positions of tokens in sequence.
-            token_ids (List[int], optional): Token IDs to identify special tokens.
+            activations (torch.Tensor): Token activations of shape (num_tokens, d_model)
+            positions (List[int], optional): Token positions for positional weighting
+            token_ids (List[int], optional): Token IDs for special token preservation
 
         Returns:
-            compressed_activations (torch.Tensor): Activations excluding redundant entries.
-            redundancy_map (Dict[int, int]): Maps redundant token index -> representative token index.
+            Tuple[torch.Tensor, Dict[int, int]]: Centroids and token mapping
         """
-        # Calculate token importance
-        importance = self.calculate_token_importance(activations)
-        print(
-            f"Token importance range: {importance.min().item():.4f} - {importance.max().item():.4f}"
-        )
+        # Calculate pairwise cosine similarity
+        activations_norm = F.normalize(activations, p=2, dim=1)
+        similarity = torch.mm(activations_norm, activations_norm.t())
 
-        # Normalize for cosine similarity
-        normalized = F.normalize(activations, p=2, dim=1)
-        # Compute pairwise cosine similarity
-        similarity = torch.mm(normalized, normalized.transpose(0, 1))
-
-        # Mask out self-similarity
-        similarity.fill_diagonal_(0.0)
+        # Set diagonal to zero to avoid self-similarity
+        similarity.fill_diagonal_(0)
 
         # Apply positional weighting if positions are provided
         if positions is not None:
@@ -522,6 +689,9 @@ class RecursiveCompressionLayer(nn.Module):
                     1 - self.position_weight
                 ) * similarity + self.position_weight * pos_sim
 
+        # Use current_threshold (which may be adaptive) instead of just base_threshold
+        current_threshold = getattr(self, "current_threshold", self.base_threshold)
+
         # Adaptive thresholding based on percentile
         flat_sim = similarity.view(-1)
         k = int(len(flat_sim) * (self.percentile_threshold / 100.0))
@@ -530,10 +700,10 @@ class RecursiveCompressionLayer(nn.Module):
             print(
                 f"Adaptive threshold based on {self.percentile_threshold}th percentile: {threshold:.4f}"
             )
-            # Use the higher of adaptive threshold or fixed threshold
-            effective_threshold = max(threshold, self.base_threshold)
+            # Use the higher of adaptive threshold or current threshold
+            effective_threshold = max(threshold, current_threshold)
         else:
-            effective_threshold = self.base_threshold
+            effective_threshold = current_threshold
 
         print(f"Effective similarity threshold: {effective_threshold:.4f}")
         print(
@@ -549,8 +719,11 @@ class RecursiveCompressionLayer(nn.Module):
                     important_indices.add(i)
 
         # Add tokens with high importance scores
-        importance_threshold = importance.median() + importance.std()
-        for i, imp in enumerate(importance):
+        importance_threshold = (
+            self.calculate_token_importance(activations).median()
+            + self.calculate_token_importance(activations).std()
+        )
+        for i, imp in enumerate(self.calculate_token_importance(activations)):
             if imp > importance_threshold:
                 important_indices.add(i)
 
@@ -581,7 +754,11 @@ class RecursiveCompressionLayer(nn.Module):
         # Visualize token clusters (for debugging)
         self.visualize_token_clusters(similarity, redundancy_map, token_ids)
 
-        return compressed_activations, redundancy_map, importance.tolist()
+        return (
+            compressed_activations,
+            redundancy_map,
+            self.calculate_token_importance(activations).tolist(),
+        )
 
     def visualize_token_clusters(
         self,
@@ -1103,6 +1280,61 @@ class RecursiveCompressionLayer(nn.Module):
         # Return indices of tokens that would be compressed
         return list(redundancy_map.keys())
 
+    def update_compression_schedule(self, epoch, total_epochs):
+        """
+        Update compression parameters based on training progress.
+        Implements a very gradual compression schedule targeting only 10% improvement.
+
+        Args:
+            epoch (int): Current epoch (0-indexed)
+            total_epochs (int): Total number of epochs for training
+        """
+        if not self.training:
+            return
+
+        # Calculate progress factor (0 at start, 1 at end)
+        progress = epoch / max(1, total_epochs - 1)
+
+        # Handle the case when base_threshold is a list or tuple
+        if isinstance(self.base_threshold, (list, tuple)):
+            # Just use the first value for simplicity
+            base_value = float(self.base_threshold[0])
+        else:
+            base_value = float(self.base_threshold)
+
+        # MINIMAL COMPRESSION SCHEDULE:
+        # Start with extremely conservative thresholds and make tiny adjustments
+        # Target only 10% improvement in compression ratio
+
+        # First 40% of training: No compression (learning phase)
+        if progress < 0.4:
+            # No compression at all - just learn the task
+            target_threshold = 0.999  # Almost no compression
+        # Middle 40% of training: Very minimal compression
+        elif progress < 0.8:
+            # Very slight compression - linear decrease from 0.999 to base_value
+            # This ensures extremely gradual introduction of compression
+            target_threshold = (
+                0.999 - (0.999 - base_value) * ((progress - 0.4) / 0.4) * 0.5
+            )
+        # Final 20% of training: Reach target compression (still conservative)
+        else:
+            # Reach the target threshold (which is already conservative)
+            target_threshold = base_value
+
+        # Smoothly interpolate current threshold
+        self.current_threshold = target_threshold
+
+        print(
+            f"Epoch {epoch+1}/{total_epochs}: Updated compression threshold to {self.current_threshold:.4f}"
+        )
+
+    def set_similarity_threshold(self, threshold):
+        """Update the similarity threshold used for compression"""
+        self.similarity_threshold = threshold
+        # If there are any sub-layers or components that need the threshold, update them too
+        # For example, if you have attention mechanisms that use this threshold
+
 
 class RecursiveCompressionModel(nn.Module):
     """
@@ -1131,10 +1363,10 @@ class RecursiveCompressionModel(nn.Module):
     def __init__(
         self,
         base_model_name: str = "gpt2",
-        num_compression_layers: int = 3,
-        compression_factor: int = 4,
+        num_compression_layers: int = 1,
+        compression_factor: int = 2,
         freeze_base_model: bool = True,
-        similarity_threshold: float = 0.75,
+        similarity_threshold: float = 0.95,
         position_weight: float = 0.2,
         percentile_threshold: float = 95.0,
         preserve_special_tokens: bool = True,

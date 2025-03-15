@@ -29,3 +29,30 @@ evaluation_results/
 
 # Miscellaneous
 .DS_Store
+compressed_model
+compressed_model/checkpoint-10
+compressed_model/checkpoint-100
+compressed_model/checkpoint-200
+compressed_model/checkpoint-300
+compressed_model/checkpoint-400
+compressed_model/checkpoint-500
+compressed_model/checkpoint-600
+compressed_model/checkpoint-700
+compressed_model/checkpoint-800
+compressed_model/checkpoint-900
+compressed_model/epoch-1
+compressed_model/epoch-2
+compressed_model/epoch-3
+compressed_model/final_model
+enhanced_model
+enhanced_model_conservative
+enhanced_model_conservative_fix
+enhanced_model_fixed
+enhanced_model_minimal
+evaluation_results
+gpt2_base_model
+gpt2_compressed_model
+improved_compressed_model
+src
+ultra_safe_model
+ultra_safe_model_v2

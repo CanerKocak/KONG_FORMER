@@ -1,17 +1,18 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import argparse
+import os
 from train_compression import (
     CompressibleLanguageModel,
     TextDataset,
     train,
     generate_text,
 )
-import argparse
-import os
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a compressible language model")
+    parser = argparse.ArgumentParser(
+        description="Train with fixed adaptive compression"
+    )
     parser.add_argument(
         "--model_name", type=str, default="gpt2", help="Base model to use"
     )
@@ -21,43 +22,20 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="compressed_model",
+        default="enhanced_model_fixed",
         help="Directory to save model",
     )
     parser.add_argument(
         "--batch_size", type=int, default=4, help="Batch size for training"
     )
     parser.add_argument(
-        "--epochs", type=int, default=3, help="Number of epochs to train"
+        "--epochs",
+        type=int,
+        default=5,
+        help="Number of epochs to train (increased to 5)",
     )
     parser.add_argument(
         "--learning_rate", type=float, default=5e-5, help="Learning rate"
-    )
-    parser.add_argument(
-        "--freeze_base", action="store_true", help="Freeze base model parameters"
-    )
-    parser.add_argument(
-        "--compression_layers", type=int, default=1, help="Number of compression layers"
-    )
-    parser.add_argument(
-        "--similarity_threshold",
-        type=float,
-        default=0.85,
-        help="Similarity threshold for compression",
-    )
-    parser.add_argument(
-        "--use_residuals",
-        action="store_true",
-        help="Use residual vectors in compression",
-    )
-    parser.add_argument(
-        "--adaptive_threshold", action="store_true", help="Use adaptive thresholding"
-    )
-    parser.add_argument(
-        "--contrastive_weight",
-        type=float,
-        default=0.1,
-        help="Weight for contrastive loss",
     )
     parser.add_argument(
         "--max_length", type=int, default=128, help="Maximum sequence length"
@@ -67,6 +45,12 @@ def main():
     )
     parser.add_argument(
         "--save_steps", type=int, default=100, help="Save model every N steps"
+    )
+    parser.add_argument(
+        "--log_steps",
+        type=int,
+        default=20,
+        help="Log stats every N steps (reduced for more frequent logging)",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
@@ -80,31 +64,19 @@ def main():
     # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load tokenizer and model
-    print(f"Loading base model: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    base_model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    # Determine compression layer indices - use 3 layers for better distribution
+    compression_indices = [3, 7, 11]  # For GPT-2, distribute across the 12 layers
 
-    # Determine compression layer indices based on number of layers
-    num_layers = base_model.config.num_hidden_layers
-    compression_indices = []
-    if args.compression_layers > 0:
-        step = max(1, num_layers // (args.compression_layers + 1))
-        compression_indices = [i * step for i in range(1, args.compression_layers + 1)]
-
-    # Create compressible model
-    print("Creating compressible model...")
+    # Create compressible model with conservative initial thresholds
+    print("Creating compressible model with fixed adaptive thresholds...")
     model = CompressibleLanguageModel(
         base_model_name=args.model_name,
         compression_layer_indices=compression_indices,
-        freeze_base_model=args.freeze_base,
-        similarity_threshold=(
-            [0.85, 0.75, 0.65]
-            if len(compression_indices) == 3
-            else args.similarity_threshold
-        ),
-        use_residuals=args.use_residuals,
-        percentile_threshold=95.0 if args.adaptive_threshold else 0.0,
+        # More conservative initial thresholds
+        similarity_threshold=[0.85, 0.75, 0.65],  # Conservative initial thresholds
+        use_residuals=True,  # Enable residuals for better reconstruction
+        percentile_threshold=95.0,  # Enable adaptive thresholding
+        use_progressive_compression=True,  # Use progressive compression based on layer depth
     )
 
     # Load training data
@@ -113,25 +85,32 @@ def main():
         tokenizer=model.tokenizer, max_length=args.max_length, file_path=args.data_path
     )
 
-    # Train model
-    print("Starting training...")
+    # Train model with more frequent logging and monitoring
+    print("Starting training with adaptive compression...")
     train(
         model=model,
         train_dataset=dataset,
         batch_size=args.batch_size,
-        epochs=args.epochs,
+        epochs=args.epochs,  # Train for more epochs to allow adaptation
         learning_rate=args.learning_rate,
         output_dir=args.output_dir,
         eval_steps=args.eval_steps,
         save_steps=args.save_steps,
+        log_steps=args.log_steps,  # More frequent logging
     )
 
     # Generate sample text
-    print("\nGenerating sample text with compressed model:")
-    prompt = "Neural networks"
-    generated_text = generate_text(model=model, prompt=prompt, max_length=100)
-    print(f"Prompt: {prompt}")
-    print(f"Generated: {generated_text}")
+    print("\nGenerating sample text with enhanced adaptive compression model:")
+    prompts = [
+        "Artificial intelligence will",
+        "The future of technology is",
+        "In the next decade, humans will",
+    ]
+
+    for prompt in prompts:
+        generated_text = generate_text(model, prompt, max_length=100)
+        print(f"\nPrompt: {prompt}")
+        print(f"Generated: {generated_text}")
 
     # Print compression statistics
     print("\nCompression Statistics:")
@@ -140,6 +119,8 @@ def main():
         if isinstance(value, list) and value:
             avg_value = sum(value) / len(value)
             print(f"{key}: {avg_value:.4f}")
+        else:
+            print(f"{key}: {value}")
 
     print(f"\nTraining complete. Model saved to {args.output_dir}")
 
