@@ -17,6 +17,7 @@ import pandas as pd
 from typing import Dict, List, Optional, Tuple, Union
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+import psutil  # Added for memory profiling
 
 # Set up the plot style
 setup_plot_style()
@@ -74,48 +75,122 @@ def load_model(model_dir: str) -> Tuple[str, str]:
         return f"Error loading model: {str(e)}", ""
 
 
-def generate_with_compression(
+def top_p_filtering(logits, top_p=0.9):
+    """Filter logits using nucleus (top-p) sampling."""
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+    sorted_indices_to_remove[:, 0] = False
+
+    # Create a new tensor with the same shape as logits filled with False
+    indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+
+    # For each row in the batch, set the indices to remove
+    for i in range(logits.size(0)):
+        indices_to_remove[i, sorted_indices[i][sorted_indices_to_remove[i]]] = True
+
+    logits[indices_to_remove] = -float("Inf")
+    return logits
+
+
+def get_memory_usage_mb():
+    """Get current memory usage of the process in MB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024)
+
+
+def stream_generate_with_memory(
     prompt: str,
     max_length: int = 200,
     temperature: float = 0.7,
     top_p: float = 0.9,
     enable_compression: bool = True,
-) -> Tuple[str, float, str]:
-    """Generate text with or without compression."""
+):
+    """Generate text with streaming output and memory usage tracking."""
     global loaded_model
 
     if loaded_model is None:
-        return "Please load a model first.", 0.0, ""
+        yield "Please load a model first.", 0, 0, ""
+        return
 
-    # Set compression state
+    # Enable/disable compression
     if hasattr(loaded_model, "compression_layers"):
         for layer in loaded_model.compression_layers:
             layer.compression_enabled = enable_compression
 
-    # Generate text
+    # Tokenize the prompt
+    tokenizer = loaded_model.tokenizer
+    input_text = prompt
+
+    # Track initial memory usage
+    initial_memory = get_memory_usage_mb()
     start_time = time.time()
-    generated_text = generate_text(
-        loaded_model,
-        prompt,
-        max_length=max_length,
-        temperature=temperature,
-        top_p=top_p,
-    )
-    generation_time = time.time() - start_time
 
-    # Get compression stats if enabled
-    stats_text = ""
-    if enable_compression and hasattr(loaded_model, "get_compression_stats"):
-        stats = loaded_model.get_compression_stats()
-        stats_text = f"Compression ratio: {stats.get('compression_ratio', 'N/A')}\n"
-        if "max_compression_ratio" in stats:
-            stats_text += (
-                f"Max compression ratio: {stats.get('max_compression_ratio', 'N/A')}\n"
-            )
-        if "target_ratio" in stats:
-            stats_text += f"Target ratio: {stats.get('target_ratio', 'N/A')}\n"
+    # Generate text incrementally
+    generated_text = prompt
 
-    return generated_text, generation_time, stats_text
+    for i in range(max_length):
+        # Tokenize the current text
+        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
+
+        # Forward pass through the model
+        with torch.no_grad():
+            outputs = loaded_model(input_ids)
+
+            # Extract logits
+            if isinstance(outputs, dict):
+                logits = outputs.get("logits", outputs.get("last_hidden_state", None))
+            else:
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+
+            if logits is None:
+                break
+
+            # Get the last token's logits
+            next_token_logits = logits[:, -1, :]
+
+            # Apply filtering and sampling
+            filtered_logits = top_p_filtering(next_token_logits, top_p=top_p)
+            probs = torch.softmax(filtered_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # Stop if we generate an EOS token
+            if next_token == tokenizer.eos_token_id:
+                break
+
+            # Decode the next token and add it to the generated text
+            next_token_text = tokenizer.decode([next_token], skip_special_tokens=True)
+            generated_text += next_token_text
+
+            # Update input for next iteration - use the full text to maintain context
+            # This is less efficient but works without past_key_values
+            input_text = generated_text
+
+            # Calculate memory usage and elapsed time
+            current_memory = get_memory_usage_mb()
+            memory_overhead = current_memory - initial_memory
+            elapsed_time = time.time() - start_time
+
+            # Get compression stats
+            stats_text = ""
+            if enable_compression and hasattr(loaded_model, "get_compression_stats"):
+                stats = loaded_model.get_compression_stats()
+                stats_text = (
+                    f"Compression ratio: {stats.get('compression_ratio', 'N/A')}\n"
+                )
+                if "max_compression_ratio" in stats:
+                    stats_text += f"Max compression ratio: {stats.get('max_compression_ratio', 'N/A')}\n"
+                if "target_ratio" in stats:
+                    stats_text += f"Target ratio: {stats.get('target_ratio', 'N/A')}\n"
+
+            # Yield the current state every few tokens or at the end
+            if (
+                i % 3 == 0
+                or i == max_length - 1
+                or next_token == tokenizer.eos_token_id
+            ):
+                yield generated_text, memory_overhead, elapsed_time, stats_text
 
 
 def compare_generation(
@@ -567,6 +642,407 @@ def visualize_compression_clusters(
         return None
 
 
+def generate_with_compression(
+    prompt: str,
+    max_length: int = 200,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    enable_compression: bool = True,
+) -> Tuple[str, float, str]:
+    """Generate text with or without compression."""
+    global loaded_model
+
+    if loaded_model is None:
+        return "Please load a model first.", 0.0, ""
+
+    # Set compression state
+    if hasattr(loaded_model, "compression_layers"):
+        for layer in loaded_model.compression_layers:
+            layer.compression_enabled = enable_compression
+
+    # Generate text
+    start_time = time.time()
+    generated_text = generate_text(
+        loaded_model,
+        prompt,
+        max_length=max_length,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    generation_time = time.time() - start_time
+
+    # Get compression stats if enabled
+    stats_text = ""
+    if enable_compression and hasattr(loaded_model, "get_compression_stats"):
+        stats = loaded_model.get_compression_stats()
+        stats_text = f"Compression ratio: {stats.get('compression_ratio', 'N/A')}\n"
+        if "max_compression_ratio" in stats:
+            stats_text += (
+                f"Max compression ratio: {stats.get('max_compression_ratio', 'N/A')}\n"
+            )
+        if "target_ratio" in stats:
+            stats_text += f"Target ratio: {stats.get('target_ratio', 'N/A')}\n"
+
+    return generated_text, generation_time, stats_text
+
+
+def compare_memory_usage(
+    prompt: str,
+    max_length: int = 100,  # Shorter for comparison
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+):
+    """Compare memory usage between compressed and uncompressed generation."""
+    global loaded_model
+
+    if loaded_model is None:
+        return "Please load a model first.", "", 0.0, 0.0, 0.0, "", None
+
+    # Data for visualization
+    token_counts = []
+    compressed_memory = []
+    uncompressed_memory = []
+
+    # First generate with compression
+    if hasattr(loaded_model, "compression_layers"):
+        for layer in loaded_model.compression_layers:
+            layer.compression_enabled = True
+
+    # Track initial memory
+    initial_memory = get_memory_usage_mb()
+    start_time = time.time()
+
+    # Tokenize the prompt
+    tokenizer = loaded_model.tokenizer
+    input_text = prompt
+    output_ids_compressed = tokenizer.encode(prompt)
+
+    # Generate with compression
+    generated_text = prompt
+
+    for i in range(max_length):
+        # Tokenize the current text
+        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
+
+        # Forward pass through the model
+        with torch.no_grad():
+            outputs = loaded_model(input_ids)
+
+            # Extract logits
+            if isinstance(outputs, dict):
+                logits = outputs.get("logits", outputs.get("last_hidden_state", None))
+            else:
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+
+            if logits is None:
+                break
+
+            # Get the last token's logits
+            next_token_logits = logits[:, -1, :]
+
+            # Apply filtering and sampling
+            filtered_logits = top_p_filtering(next_token_logits, top_p=top_p)
+            probs = torch.softmax(filtered_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # Stop if we generate an EOS token
+            if next_token == tokenizer.eos_token_id:
+                break
+
+            # Decode the next token and add it to the generated text
+            next_token_text = tokenizer.decode([next_token], skip_special_tokens=True)
+            generated_text += next_token_text
+            output_ids_compressed.append(next_token)
+
+            # Update input for next iteration
+            input_text = generated_text
+
+            # Record memory usage
+            current_memory = get_memory_usage_mb()
+            token_counts.append(len(output_ids_compressed))
+            compressed_memory.append(current_memory - initial_memory)
+
+    # Get the compressed text
+    compressed_text = generated_text
+    compressed_time = time.time() - start_time
+
+    # Reset memory state
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # Now generate without compression
+    if hasattr(loaded_model, "compression_layers"):
+        for layer in loaded_model.compression_layers:
+            layer.compression_enabled = False
+
+    # Track initial memory again
+    initial_memory = get_memory_usage_mb()
+    start_time = time.time()
+
+    # Generate without compression
+    input_text = prompt
+    generated_text = prompt
+    output_ids_uncompressed = tokenizer.encode(prompt)
+
+    for i in range(max_length):
+        if i >= len(token_counts):
+            break
+
+        # Tokenize the current text
+        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
+
+        # Forward pass through the model
+        with torch.no_grad():
+            outputs = loaded_model(input_ids)
+
+            # Extract logits
+            if isinstance(outputs, dict):
+                logits = outputs.get("logits", outputs.get("last_hidden_state", None))
+            else:
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+
+            if logits is None:
+                break
+
+            # Get the last token's logits
+            next_token_logits = logits[:, -1, :]
+
+            # Apply filtering and sampling
+            filtered_logits = top_p_filtering(next_token_logits, top_p=top_p)
+            probs = torch.softmax(filtered_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # Stop if we generate an EOS token
+            if next_token == tokenizer.eos_token_id:
+                break
+
+            # Decode the next token and add it to the generated text
+            next_token_text = tokenizer.decode([next_token], skip_special_tokens=True)
+            generated_text += next_token_text
+            output_ids_uncompressed.append(next_token)
+
+            # Update input for next iteration
+            input_text = generated_text
+
+            # Record memory usage
+            current_memory = get_memory_usage_mb()
+            uncompressed_memory.append(current_memory - initial_memory)
+
+    # Get the uncompressed text
+    uncompressed_text = generated_text
+    uncompressed_time = time.time() - start_time
+
+    # Calculate speedup
+    speedup = uncompressed_time / compressed_time if compressed_time > 0 else 0
+
+    # Get compression stats
+    if hasattr(loaded_model, "compression_layers"):
+        # Re-enable compression to get stats
+        for layer in loaded_model.compression_layers:
+            layer.compression_enabled = True
+
+    stats_text = ""
+    if hasattr(loaded_model, "get_compression_stats"):
+        stats = loaded_model.get_compression_stats()
+        stats_text = f"Compression ratio: {stats.get('compression_ratio', 'N/A')}\n"
+        if "max_compression_ratio" in stats:
+            stats_text += (
+                f"Max compression ratio: {stats.get('max_compression_ratio', 'N/A')}\n"
+            )
+        if "target_ratio" in stats:
+            stats_text += f"Target ratio: {stats.get('target_ratio', 'N/A')}\n"
+
+    # Create comparison plot
+    fig = plt.figure(figsize=(12, 6))
+    plt.plot(
+        token_counts,
+        compressed_memory,
+        marker="o",
+        linestyle="-",
+        color="blue",
+        label="With Compression",
+    )
+    plt.plot(
+        token_counts[: len(uncompressed_memory)],
+        uncompressed_memory,
+        marker="x",
+        linestyle="-",
+        color="red",
+        label="Without Compression",
+    )
+    plt.title("Memory Usage Comparison: Compressed vs Uncompressed")
+    plt.xlabel("Number of Tokens")
+    plt.ylabel("Memory Overhead (MB)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Add memory savings annotation
+    if len(compressed_memory) > 0 and len(uncompressed_memory) > 0:
+        last_idx = min(len(compressed_memory), len(uncompressed_memory)) - 1
+        if last_idx >= 0:
+            memory_savings = uncompressed_memory[last_idx] - compressed_memory[last_idx]
+            savings_percent = (
+                (memory_savings / uncompressed_memory[last_idx]) * 100
+                if uncompressed_memory[last_idx] > 0
+                else 0
+            )
+            plt.annotate(
+                f"Memory savings: {memory_savings:.2f} MB ({savings_percent:.1f}%)",
+                xy=(
+                    token_counts[last_idx],
+                    (compressed_memory[last_idx] + uncompressed_memory[last_idx]) / 2,
+                ),
+                xytext=(
+                    token_counts[last_idx] * 0.7,
+                    (compressed_memory[last_idx] + uncompressed_memory[last_idx]) / 1.5,
+                ),
+                arrowprops=dict(facecolor="black", shrink=0.05, width=1.5, headwidth=8),
+                fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.3", fc="yellow", alpha=0.3),
+            )
+
+    # Save the plot to a bytes buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=150)
+    buf.seek(0)
+
+    # Convert to PIL Image
+    comparison_plot = Image.open(buf)
+    plt.close(fig)
+
+    return (
+        compressed_text,
+        uncompressed_text,
+        compressed_time,
+        uncompressed_time,
+        speedup,
+        stats_text,
+        comparison_plot,
+    )
+
+
+def stream_generate_with_memory_and_visualization(
+    prompt: str,
+    max_length: int = 200,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    enable_compression: bool = True,
+):
+    """Generate text with streaming output, memory usage tracking, and visualization."""
+    global loaded_model
+
+    if loaded_model is None:
+        yield "Please load a model first.", 0, 0, "", None
+        return
+
+    # Enable/disable compression
+    if hasattr(loaded_model, "compression_layers"):
+        for layer in loaded_model.compression_layers:
+            layer.compression_enabled = enable_compression
+
+    # Tokenize the prompt
+    tokenizer = loaded_model.tokenizer
+    input_text = prompt
+
+    # Track initial memory usage
+    initial_memory = get_memory_usage_mb()
+    start_time = time.time()
+
+    # For visualization
+    token_count = [len(tokenizer.encode(prompt))]
+    memory_values = [0]  # Start with 0 overhead
+
+    # Generate text incrementally
+    generated_text = prompt
+
+    for i in range(max_length):
+        # Tokenize the current text
+        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
+
+        # Forward pass through the model
+        with torch.no_grad():
+            outputs = loaded_model(input_ids)
+
+            # Extract logits
+            if isinstance(outputs, dict):
+                logits = outputs.get("logits", outputs.get("last_hidden_state", None))
+            else:
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs
+
+            if logits is None:
+                break
+
+            # Get the last token's logits
+            next_token_logits = logits[:, -1, :]
+
+            # Apply filtering and sampling
+            filtered_logits = top_p_filtering(next_token_logits, top_p=top_p)
+            probs = torch.softmax(filtered_logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # Stop if we generate an EOS token
+            if next_token == tokenizer.eos_token_id:
+                break
+
+            # Decode the next token and add it to the generated text
+            next_token_text = tokenizer.decode([next_token], skip_special_tokens=True)
+            generated_text += next_token_text
+
+            # Update input for next iteration - use the full text to maintain context
+            input_text = generated_text
+
+            # Calculate memory usage and elapsed time
+            current_memory = get_memory_usage_mb()
+            memory_overhead = current_memory - initial_memory
+            elapsed_time = time.time() - start_time
+
+            # Update visualization data
+            token_count.append(len(tokenizer.encode(generated_text)))
+            memory_values.append(memory_overhead)
+
+            # Create memory usage plot every few tokens or at the end
+            if (
+                i % 3 == 0
+                or i == max_length - 1
+                or next_token == tokenizer.eos_token_id
+            ):
+                fig = plt.figure(figsize=(10, 4))
+                plt.plot(
+                    token_count, memory_values, marker="o", linestyle="-", color="blue"
+                )
+                plt.title("Memory Usage During Generation")
+                plt.xlabel("Number of Tokens")
+                plt.ylabel("Memory Overhead (MB)")
+                plt.grid(True, alpha=0.3)
+
+                # Save the plot to a bytes buffer
+                buf = io.BytesIO()
+                plt.savefig(buf, format="png")
+                buf.seek(0)
+
+                # Convert to PIL Image
+                memory_plot = Image.open(buf)
+                plt.close(fig)
+
+                # Get compression stats
+                stats_text = ""
+                if enable_compression and hasattr(
+                    loaded_model, "get_compression_stats"
+                ):
+                    stats = loaded_model.get_compression_stats()
+                    stats_text = (
+                        f"Compression ratio: {stats.get('compression_ratio', 'N/A')}\n"
+                    )
+                    if "max_compression_ratio" in stats:
+                        stats_text += f"Max compression ratio: {stats.get('max_compression_ratio', 'N/A')}\n"
+                    if "target_ratio" in stats:
+                        stats_text += (
+                            f"Target ratio: {stats.get('target_ratio', 'N/A')}\n"
+                        )
+
+                # Yield the current state
+                yield generated_text, memory_overhead, elapsed_time, stats_text, memory_plot
+
+
 # Create the Gradio interface
 with gr.Blocks(
     title="Neural Compression Model Interface", theme=gr.themes.Soft()
@@ -640,6 +1116,85 @@ with gr.Blocks(
                 compression_checkbox,
             ],
             outputs=[generated_text, generation_time, compression_stats],
+        )
+
+    with gr.Tab("Streaming Generation"):
+        with gr.Row():
+            with gr.Column(scale=1):
+                stream_prompt_input = gr.Textbox(
+                    label="Prompt", placeholder="Enter your prompt here", lines=3
+                )
+                with gr.Row():
+                    stream_max_length_slider = gr.Slider(
+                        minimum=10, maximum=500, value=200, step=10, label="Max Length"
+                    )
+                    stream_temperature_slider = gr.Slider(
+                        minimum=0.1,
+                        maximum=1.5,
+                        value=0.7,
+                        step=0.1,
+                        label="Temperature",
+                    )
+                    stream_top_p_slider = gr.Slider(
+                        minimum=0.1, maximum=1.0, value=0.9, step=0.1, label="Top-p"
+                    )
+
+                stream_compression_checkbox = gr.Checkbox(
+                    label="Enable Compression", value=True
+                )
+                stream_generate_button = gr.Button(
+                    "Generate with Streaming", variant="primary"
+                )
+
+            with gr.Column(scale=1):
+                stream_generated_text = gr.Textbox(
+                    label="Generated Text", interactive=False, lines=15
+                )
+                with gr.Row():
+                    memory_usage = gr.Number(
+                        label="Memory Overhead (MB)", interactive=False
+                    )
+                    stream_generation_time = gr.Number(
+                        label="Generation Time (seconds)", interactive=False
+                    )
+                stream_compression_stats = gr.Textbox(
+                    label="Compression Stats", interactive=False, lines=3
+                )
+
+        with gr.Row():
+            memory_plot = gr.Image(
+                label="Memory Usage Visualization", interactive=False
+            )
+
+        gr.Markdown(
+            """
+        ### Streaming Generation with Memory Profiling
+        
+        This tab provides real-time token streaming with memory usage tracking. Watch as:
+        
+        - Text is generated token-by-token in real time
+        - Memory usage is tracked to measure compression efficiency
+        - Generation time is updated continuously
+        - Memory usage visualization shows the impact of compression over time
+        """
+        )
+
+        stream_generate_button.click(
+            stream_generate_with_memory_and_visualization,
+            inputs=[
+                stream_prompt_input,
+                stream_max_length_slider,
+                stream_temperature_slider,
+                stream_top_p_slider,
+                stream_compression_checkbox,
+            ],
+            outputs=[
+                stream_generated_text,
+                memory_usage,
+                stream_generation_time,
+                stream_compression_stats,
+                memory_plot,
+            ],
         )
 
     with gr.Tab("Compare Generation"):
@@ -792,6 +1347,92 @@ with gr.Blocks(
                     inputs=[cluster_text, cluster_layer],
                     outputs=[cluster_plot],
                 )
+
+    with gr.Tab("Memory Comparison"):
+        with gr.Row():
+            with gr.Column():
+                compare_memory_prompt = gr.Textbox(
+                    label="Prompt", placeholder="Enter your prompt here", lines=3
+                )
+                with gr.Row():
+                    compare_memory_max_length = gr.Slider(
+                        minimum=10, maximum=200, value=50, step=10, label="Max Length"
+                    )
+                    compare_memory_temperature = gr.Slider(
+                        minimum=0.1,
+                        maximum=1.5,
+                        value=0.7,
+                        step=0.1,
+                        label="Temperature",
+                    )
+                    compare_memory_top_p = gr.Slider(
+                        minimum=0.1, maximum=1.0, value=0.9, step=0.1, label="Top-p"
+                    )
+
+                compare_memory_button = gr.Button(
+                    "Compare Memory Usage", variant="primary"
+                )
+
+        with gr.Row():
+            with gr.Column():
+                compare_memory_compressed = gr.Textbox(
+                    label="With Compression", interactive=False, lines=5
+                )
+                compare_memory_compressed_time = gr.Number(
+                    label="Time (seconds)", interactive=False
+                )
+
+            with gr.Column():
+                compare_memory_uncompressed = gr.Textbox(
+                    label="Without Compression", interactive=False, lines=5
+                )
+                compare_memory_uncompressed_time = gr.Number(
+                    label="Time (seconds)", interactive=False
+                )
+
+        with gr.Row():
+            compare_memory_speedup = gr.Number(label="Speedup (x)", interactive=False)
+            compare_memory_stats = gr.Textbox(
+                label="Compression Stats", interactive=False, lines=3
+            )
+
+        with gr.Row():
+            compare_memory_plot = gr.Image(
+                label="Memory Usage Comparison", interactive=False
+            )
+
+        gr.Markdown(
+            """
+        ### Memory Usage Comparison
+        
+        This tab compares memory usage between compressed and uncompressed generation:
+        
+        - See how memory grows with each token for both methods
+        - Visualize memory savings from compression
+        - Compare generation speed and quality
+        
+        Lower memory usage means more efficient inference and the ability to run larger models on the same hardware.
+        """
+        )
+
+        compare_memory_button.click(
+            compare_memory_usage,
+            inputs=[
+                compare_memory_prompt,
+                compare_memory_max_length,
+                compare_memory_temperature,
+                compare_memory_top_p,
+            ],
+            outputs=[
+                compare_memory_compressed,
+                compare_memory_uncompressed,
+                compare_memory_compressed_time,
+                compare_memory_uncompressed_time,
+                compare_memory_speedup,
+                compare_memory_stats,
+                compare_memory_plot,
+            ],
+        )
 
 # Launch the app
 if __name__ == "__main__":
